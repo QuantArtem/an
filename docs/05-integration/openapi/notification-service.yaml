@@ -1,0 +1,82 @@
+openapi: 3.0.3
+info:
+  title: LockerFlow — Notification Service API
+  version: 1.0.0
+  description: |
+    Журнал уведомлений получателям. Сами уведомления отправляются автоматически по событиям
+    `shipment.*` (см. AsyncAPI) — API для отправки нет.
+
+    > **Ограничение прототипа:** эндпоинт не аутентифицируется, а текст сообщения содержит код
+    > получения в открытом виде — этим пользуются e2e-тесты. В промышленной версии доступ только
+    > для роли `support`, код в тексте маскируется (NFR-24, ADR-0008).
+servers:
+  - url: http://localhost:8080
+    description: Локальный стенд (через API Gateway)
+tags:
+  - name: notifications
+
+paths:
+  /api/v1/notifications:
+    get:
+      tags: [notifications]
+      operationId: listNotifications
+      summary: Уведомления по отправлению
+      description: Сообщения в хронологическом порядке (FR-29).
+      parameters:
+        - name: shipmentId
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Журнал уведомлений
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Notification' }
+        '400':
+          description: '`VALIDATION_ERROR` — не передан или некорректен `shipmentId`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Notification:
+      type: object
+      required: [id, shipmentId, channel, recipient, template, body, status, createdAt]
+      properties:
+        id: { type: string, format: uuid }
+        shipmentId: { type: string, format: uuid }
+        channel: { type: string, enum: [SMS, EMAIL] }
+        recipient: { type: string, description: Телефон или e-mail, example: '+79161234567' }
+        template:
+          type: string
+          enum: [READY_FOR_PICKUP, PAYMENT_RECEIVED, DELIVERED, STORAGE_EXPIRED]
+          description: |
+            | Шаблон | Событие-причина |
+            |---|---|
+            | `READY_FOR_PICKUP` | `shipment.ready_for_pickup` |
+            | `PAYMENT_RECEIVED` | `shipment.paid` |
+            | `DELIVERED` | `shipment.delivered` |
+            | `STORAGE_EXPIRED` | `shipment.expired` |
+        body: { type: string, description: Текст сообщения }
+        status: { type: string, enum: [SENT, FAILED] }
+        createdAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      required: [type, title, status, code, detail, instance, correlationId]
+      additionalProperties: true
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string }
+        detail: { type: string }
+        instance: { type: string }
+        correlationId: { type: string }

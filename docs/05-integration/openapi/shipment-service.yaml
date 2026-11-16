@@ -1,0 +1,449 @@
+openapi: 3.0.3
+info:
+  title: LockerFlow — Shipment Service API
+  version: 1.0.0
+  description: |
+    API управления отправлениями для интернет-магазинов (партнёров).
+
+    **Общие правила**
+
+    * Аутентификация — API-ключ в заголовке `X-API-Key`.
+    * Денежные суммы — целые числа в копейках.
+    * Время — UTC в формате ISO 8601.
+    * Ошибки — в формате RFC 7807 (`application/problem+json`), см. схему `Problem`.
+    * Создание отправления асинхронно: ответ `202` означает «принято», итог резервирования ячейки
+      партнёр узнаёт из `GET /shipments/{shipmentId}` (статусы `CELL_RESERVED` или `REJECTED`).
+    * Каждый ответ содержит заголовок `X-Correlation-Id` — передавайте его при обращении в поддержку.
+servers:
+  - url: http://localhost:8080
+    description: Локальный стенд (через API Gateway)
+  - url: http://localhost:8001
+    description: Локальный стенд (напрямую, включая /internal)
+tags:
+  - name: shipments
+    description: Отправления партнёра
+  - name: tracking
+    description: Публичное отслеживание для получателя
+  - name: internal
+    description: Операторские действия. Не публикуются через API Gateway
+
+paths:
+  /api/v1/shipments:
+    post:
+      tags: [shipments]
+      operationId: createShipment
+      summary: Создать отправление
+      description: |
+        Регистрирует отправление и запускает резервирование ячейки (FR-01…FR-04, UC-01).
+
+        Запрос идемпотентен по заголовку `Idempotency-Key`: повтор с тем же ключом и телом
+        возвращает ранее созданное отправление с заголовком `Idempotent-Replayed: true`.
+      security: [{ ApiKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CorrelationId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateShipmentRequest' }
+            examples:
+              prepaid:
+                summary: Предоплаченный заказ
+                value:
+                  externalOrderId: ORD-2026-000123
+                  lockerId: 11111111-1111-4111-8111-111111111111
+                  parcelSize: M
+                  recipient: { name: Иван Петров, phone: '+79161234567' }
+                  payment: { type: PREPAID, amount: 0 }
+              payOnPickup:
+                summary: Оплата при получении, 1 499 ₽
+                value:
+                  externalOrderId: ORD-2026-000124
+                  lockerId: 11111111-1111-4111-8111-111111111111
+                  parcelSize: S
+                  recipient: { name: Анна Смирнова, phone: '+79031112233', email: anna@example.com }
+                  payment: { type: ON_PICKUP, amount: 149900, currency: RUB }
+      responses:
+        '202':
+          description: Отправление принято, резервирование ячейки выполняется
+          headers:
+            Location:
+              description: Адрес созданного ресурса
+              schema: { type: string }
+            Idempotent-Replayed:
+              description: Присутствует со значением `true`, если возвращён результат прежнего запроса
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shipment' }
+        '400':
+          description: '`VALIDATION_ERROR` — некорректные данные; `IDEMPOTENCY_KEY_REQUIRED` — не передан ключ'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://docs.lockerflow.example/errors/VALIDATION_ERROR
+                title: Validation error
+                status: 400
+                code: VALIDATION_ERROR
+                detail: Запрос не прошёл валидацию
+                instance: /api/v1/shipments
+                correlationId: 5f0c1a2e-7c0b-4a57-9d3e-0d4f7f1f8a11
+                errors:
+                  - { field: recipient.phone, message: "String should match pattern '^\\+\\d{10,15}$'" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PartnerBlocked' }
+        '409':
+          description: '`DUPLICATE_EXTERNAL_ORDER` — отправление с таким номером заказа уже существует; в поле `shipmentId` — его идентификатор'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: '`IDEMPOTENCY_KEY_REUSED` — ключ уже использован с другим телом запроса'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+    get:
+      tags: [shipments]
+      operationId: listShipments
+      summary: Список отправлений партнёра
+      description: Возвращает отправления в порядке убывания даты создания (FR-05).
+      security: [{ ApiKey: [] }]
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ShipmentStatus' }
+        - name: externalOrderId
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Страница списка
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total, limit, offset]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Shipment' }
+                  total: { type: integer, description: 'Всего отправлений, подходящих под фильтр' }
+                  limit: { type: integer }
+                  offset: { type: integer }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/v1/shipments/{shipmentId}:
+    get:
+      tags: [shipments]
+      operationId: getShipment
+      summary: Получить отправление
+      security: [{ ApiKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ShipmentId'
+      responses:
+        '200':
+          description: Отправление
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shipment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/ShipmentNotFound' }
+
+  /api/v1/shipments/{shipmentId}/history:
+    get:
+      tags: [shipments]
+      operationId: getShipmentHistory
+      summary: История статусов отправления
+      description: Все смены статуса в хронологическом порядке (FR-06).
+      security: [{ ApiKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ShipmentId'
+      responses:
+        '200':
+          description: История
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/StatusHistoryItem' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/ShipmentNotFound' }
+
+  /api/v1/shipments/{shipmentId}/cancel:
+    post:
+      tags: [shipments]
+      operationId: cancelShipment
+      summary: Отменить отправление
+      description: |
+        Доступно в статусах `CREATED` и `CELL_RESERVED` (BR-06). Повторная отмена уже отменённого
+        отправления возвращает `200` без изменений.
+      security: [{ ApiKey: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ShipmentId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                reason: { type: string, maxLength: 500, example: Покупатель отказался от заказа }
+      responses:
+        '200':
+          description: Отправление отменено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shipment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/ShipmentNotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+
+  /api/v1/tracking/{shipmentId}:
+    get:
+      tags: [tracking]
+      operationId: trackShipment
+      summary: Публичное отслеживание
+      description: |
+        Не требует аутентификации: право доступа даёт знание идентификатора (UUID v4) из ссылки в SMS.
+        Ответ не содержит персональных данных и кода получения (FR-10).
+      parameters:
+        - $ref: '#/components/parameters/ShipmentId'
+      responses:
+        '200':
+          description: Состояние отправления
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tracking' }
+        '404': { $ref: '#/components/responses/ShipmentNotFound' }
+
+  /internal/v1/shipments/{shipmentId}/expire:
+    post:
+      tags: [internal]
+      operationId: forceExpireShipment
+      summary: Досрочно завершить хранение
+      description: Операторское действие (FR-11). Переводит отправление из `READY_FOR_PICKUP` в `EXPIRED`.
+      parameters:
+        - $ref: '#/components/parameters/ShipmentId'
+      responses:
+        '200':
+          description: Хранение завершено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Shipment' }
+        '404': { $ref: '#/components/responses/ShipmentNotFound' }
+        '409': { $ref: '#/components/responses/InvalidState' }
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Ключ партнёра. На стенде — `demo-partner-key`
+
+  parameters:
+    ShipmentId:
+      name: shipmentId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный идентификатор запроса, рекомендуется UUID v4. Хранится 24 часа
+      schema: { type: string, maxLength: 128 }
+    CorrelationId:
+      name: X-Correlation-Id
+      in: header
+      required: false
+      description: Сквозной идентификатор запроса. Если не передан — генерируется системой
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: '`UNAUTHORIZED` — API-ключ не передан или неизвестен'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    PartnerBlocked:
+      description: '`PARTNER_BLOCKED` — партнёр заблокирован'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationError:
+      description: '`VALIDATION_ERROR` — некорректные параметры запроса'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ShipmentNotFound:
+      description: '`SHIPMENT_NOT_FOUND` — отправление не существует или принадлежит другому партнёру'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    InvalidState:
+      description: '`INVALID_SHIPMENT_STATE` — операция недопустима в текущем статусе; поле `currentStatus` содержит его'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+          example:
+            type: https://docs.lockerflow.example/errors/INVALID_SHIPMENT_STATE
+            title: Invalid shipment state
+            status: 409
+            code: INVALID_SHIPMENT_STATE
+            detail: Отмена невозможна в статусе READY_FOR_PICKUP
+            instance: /api/v1/shipments/7b6f6f0e-2f55-4d6e-9d5c-3c1f8f1e2a10/cancel
+            correlationId: 5f0c1a2e-7c0b-4a57-9d3e-0d4f7f1f8a11
+            currentStatus: READY_FOR_PICKUP
+
+  schemas:
+    ShipmentStatus:
+      type: string
+      enum: [CREATED, CELL_RESERVED, READY_FOR_PICKUP, DELIVERED, REJECTED, CANCELLED, EXPIRED, RETURNED]
+      description: |
+        * `CREATED` — принято, ячейка подбирается
+        * `CELL_RESERVED` — ячейка забронирована, ожидается курьер
+        * `READY_FOR_PICKUP` — посылка в ячейке
+        * `DELIVERED` — выдано получателю
+        * `REJECTED` — ячейку забронировать не удалось
+        * `CANCELLED` — отменено
+        * `EXPIRED` — срок хранения истёк
+        * `RETURNED` — изъято для возврата партнёру
+    PaymentStatus:
+      type: string
+      enum: [NOT_REQUIRED, AWAITING, PAID]
+    ParcelSize:
+      type: string
+      enum: [S, M, L]
+      description: 'S — до 15×35×45 см, M — до 30×35×45 см, L — до 45×35×60 см'
+    Recipient:
+      type: object
+      additionalProperties: false
+      required: [name, phone]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200, example: Иван Петров }
+        phone:
+          type: string
+          pattern: '^\+\d{10,15}$'
+          description: Мобильный телефон в формате E.164
+          example: '+79161234567'
+        email: { type: string, format: email, nullable: true }
+    PaymentTerms:
+      type: object
+      additionalProperties: false
+      required: [type]
+      description: 'BR-02: для `ON_PICKUP` сумма > 0, для `PREPAID` сумма = 0'
+      properties:
+        type:
+          type: string
+          enum: [PREPAID, ON_PICKUP]
+        amount:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 50000000
+          default: 0
+          description: Сумма к оплате при получении, в копейках
+          example: 149900
+        currency:
+          type: string
+          enum: [RUB]
+          default: RUB
+    CreateShipmentRequest:
+      type: object
+      additionalProperties: false
+      required: [externalOrderId, lockerId, parcelSize, recipient, payment]
+      properties:
+        externalOrderId:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Номер заказа в системе партнёра. Уникален в рамках партнёра (BR-01)
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат из справочника `GET /api/v1/lockers`
+        parcelSize: { $ref: '#/components/schemas/ParcelSize' }
+        recipient: { $ref: '#/components/schemas/Recipient' }
+        payment: { $ref: '#/components/schemas/PaymentTerms' }
+    Shipment:
+      type: object
+      required: [id, externalOrderId, status, paymentStatus, lockerId, parcelSize, recipient, payment, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid }
+        externalOrderId: { type: string }
+        status: { $ref: '#/components/schemas/ShipmentStatus' }
+        statusReason:
+          type: string
+          nullable: true
+          description: 'Причина текущего статуса: `NO_FREE_CELLS`, `LOCKER_NOT_FOUND`, `LOCKER_UNAVAILABLE`, `RESERVATION_EXPIRED`, `STORAGE_EXPIRED`, `CANCELLED_BY_PARTNER` либо текст, переданный при отмене'
+        paymentStatus: { $ref: '#/components/schemas/PaymentStatus' }
+        lockerId: { type: string, format: uuid }
+        lockerAddress: { type: string, nullable: true, description: Заполняется после резервирования ячейки }
+        cellNumber: { type: integer, nullable: true, description: Заполняется после резервирования ячейки }
+        parcelSize: { $ref: '#/components/schemas/ParcelSize' }
+        recipient: { $ref: '#/components/schemas/Recipient' }
+        payment: { $ref: '#/components/schemas/PaymentTerms' }
+        storageUntil: { type: string, format: date-time, nullable: true, description: Окончание срока хранения; заполняется после закладки }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    StatusHistoryItem:
+      type: object
+      required: [toStatus, actor, createdAt]
+      properties:
+        fromStatus:
+          allOf: [{ $ref: '#/components/schemas/ShipmentStatus' }]
+          nullable: true
+        toStatus: { $ref: '#/components/schemas/ShipmentStatus' }
+        reason: { type: string, nullable: true }
+        actor:
+          type: string
+          description: Инициатор перехода
+          enum: [partner, system, operator, locker-service]
+        createdAt: { type: string, format: date-time }
+    Tracking:
+      type: object
+      required: [id, status, paymentStatus, amountDue, currency]
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/ShipmentStatus' }
+        paymentStatus: { $ref: '#/components/schemas/PaymentStatus' }
+        lockerAddress: { type: string, nullable: true }
+        storageUntil: { type: string, format: date-time, nullable: true }
+        amountDue: { type: integer, format: int64, description: 'Сумма к оплате в копейках; 0, если оплата не требуется или получена' }
+        currency: { type: string }
+    Problem:
+      type: object
+      description: Ошибка в формате RFC 7807. Может содержать дополнительные поля, зависящие от кода
+      required: [type, title, status, code, detail, instance, correlationId]
+      additionalProperties: true
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, description: 'Машиночитаемый код, см. каталог ошибок', example: SHIPMENT_NOT_FOUND }
+        detail: { type: string, description: Описание для человека }
+        instance: { type: string, description: Путь запроса }
+        correlationId: { type: string }
+        errors:
+          type: array
+          description: Только для `VALIDATION_ERROR`
+          items:
+            type: object
+            properties:
+              field: { type: string }
+              message: { type: string }

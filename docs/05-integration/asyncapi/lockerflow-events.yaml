@@ -1,0 +1,1058 @@
+asyncapi: 3.0.0
+info:
+  title: 'LockerFlow: события'
+  version: 1.0.0
+  description: |
+    Контракт асинхронного взаимодействия сервисов LockerFlow через Apache Kafka.
+
+    **Соглашения** (обоснование: ADR-0003, ADR-0005):
+
+    * Один топик на контекст-издатель; писать в топик может только его владелец.
+    * Ключ сообщения равен `shipmentId`: все события одного отправления попадают в одну партицию и читаются по порядку.
+    * Гарантия доставки at-least-once. Потребитель обязан быть идемпотентным: дедупликация по `eventId`.
+    * Тип события передаётся в поле конверта `eventType`; потребитель игнорирует неизвестные типы.
+    * Совместимость: добавление необязательных полей не меняет `eventVersion`; удаление поля или изменение его смысла требует новой версии.
+    * Событие, не обработанное за 3 попытки, отправляется в топик `lockerflow.dlq`.
+defaultContentType: application/json
+servers:
+  local:
+    host: kafka:9092
+    protocol: kafka
+    description: Локальный стенд (Docker Compose), без аутентификации
+  production:
+    host: kafka.lockerflow.example:9093
+    protocol: kafka-secure
+    description: 'Целевая среда: SASL/SCRAM, ACL на топики (ADR-0007)'
+channels:
+  shipmentEvents:
+    address: shipment.events
+    description: 'События жизненного цикла отправления. Издатель: shipment-service. На стенде 3 партиции; целевой
+      срок хранения 7 суток.'
+    messages:
+      shipmentCreated:
+        $ref: '#/components/messages/ShipmentCreated'
+      shipmentRejected:
+        $ref: '#/components/messages/ShipmentRejected'
+      shipmentCancelled:
+        $ref: '#/components/messages/ShipmentCancelled'
+      shipmentReadyForPickup:
+        $ref: '#/components/messages/ShipmentReadyForPickup'
+      shipmentPaid:
+        $ref: '#/components/messages/ShipmentPaid'
+      shipmentDelivered:
+        $ref: '#/components/messages/ShipmentDelivered'
+      shipmentExpired:
+        $ref: '#/components/messages/ShipmentExpired'
+      shipmentReturned:
+        $ref: '#/components/messages/ShipmentReturned'
+  lockerEvents:
+    address: locker.events
+    description: 'События постаматов и ячеек. Издатель: locker-service. На стенде 3 партиции; целевой срок хранения
+      7 суток.'
+    messages:
+      lockerCellReserved:
+        $ref: '#/components/messages/LockerCellReserved'
+      lockerCellReservationFailed:
+        $ref: '#/components/messages/LockerCellReservationFailed'
+      lockerCellReleased:
+        $ref: '#/components/messages/LockerCellReleased'
+      lockerReservationExpired:
+        $ref: '#/components/messages/LockerReservationExpired'
+      lockerParcelDeposited:
+        $ref: '#/components/messages/LockerParcelDeposited'
+      lockerParcelPickedUp:
+        $ref: '#/components/messages/LockerParcelPickedUp'
+      lockerParcelReturned:
+        $ref: '#/components/messages/LockerParcelReturned'
+  paymentEvents:
+    address: payment.events
+    description: 'События платежей. Издатель: payment-service. На стенде 3 партиции; целевой срок хранения 7 суток.'
+    messages:
+      paymentSucceeded:
+        $ref: '#/components/messages/PaymentSucceeded'
+      paymentFailed:
+        $ref: '#/components/messages/PaymentFailed'
+  deadLetter:
+    address: lockerflow.dlq
+    description: 'Dead Letter Queue: события, которые потребитель не смог обработать за 3 попытки. Разбирается вручную,
+      алерт на любое новое сообщение (NFR-14).'
+    messages:
+      deadLetter:
+        $ref: '#/components/messages/DeadLetter'
+operations:
+  shipmentServicePublish:
+    action: send
+    channel:
+      $ref: '#/channels/shipmentEvents'
+    summary: shipment-service публикует события отправления
+    messages:
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCreated'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentRejected'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCancelled'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentReadyForPickup'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentPaid'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentDelivered'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentExpired'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentReturned'
+  lockerServicePublish:
+    action: send
+    channel:
+      $ref: '#/channels/lockerEvents'
+    summary: locker-service публикует события ячеек
+    messages:
+    - $ref: '#/channels/lockerEvents/messages/lockerCellReserved'
+    - $ref: '#/channels/lockerEvents/messages/lockerCellReservationFailed'
+    - $ref: '#/channels/lockerEvents/messages/lockerCellReleased'
+    - $ref: '#/channels/lockerEvents/messages/lockerReservationExpired'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelDeposited'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelPickedUp'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelReturned'
+  paymentServicePublish:
+    action: send
+    channel:
+      $ref: '#/channels/paymentEvents'
+    summary: payment-service публикует события платежей
+    messages:
+    - $ref: '#/channels/paymentEvents/messages/paymentSucceeded'
+    - $ref: '#/channels/paymentEvents/messages/paymentFailed'
+  shipmentServiceOnLockerEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/lockerEvents'
+    summary: shipment-service меняет статус отправления
+    messages:
+    - $ref: '#/channels/lockerEvents/messages/lockerCellReserved'
+    - $ref: '#/channels/lockerEvents/messages/lockerCellReservationFailed'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelDeposited'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelPickedUp'
+    - $ref: '#/channels/lockerEvents/messages/lockerParcelReturned'
+    - $ref: '#/channels/lockerEvents/messages/lockerReservationExpired'
+    description: 'Группа потребителей: shipment-service'
+  shipmentServiceOnPaymentEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/paymentEvents'
+    summary: shipment-service отмечает отправление оплаченным
+    messages:
+    - $ref: '#/channels/paymentEvents/messages/paymentSucceeded'
+    description: 'Группа потребителей: shipment-service'
+  lockerServiceOnShipmentEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/shipmentEvents'
+    summary: locker-service резервирует и освобождает ячейки, обновляет признак оплаты
+    messages:
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCreated'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCancelled'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentPaid'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentExpired'
+    description: 'Группа потребителей: locker-service'
+  paymentServiceOnShipmentEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/shipmentEvents'
+    summary: payment-service открывает и закрывает счета
+    messages:
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCreated'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentRejected'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentCancelled'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentExpired'
+    description: 'Группа потребителей: payment-service'
+  notificationServiceOnShipmentEvents:
+    action: receive
+    channel:
+      $ref: '#/channels/shipmentEvents'
+    summary: notification-service отправляет SMS получателю
+    messages:
+    - $ref: '#/channels/shipmentEvents/messages/shipmentReadyForPickup'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentPaid'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentDelivered'
+    - $ref: '#/channels/shipmentEvents/messages/shipmentExpired'
+    description: 'Группа потребителей: notification-service'
+  publishDeadLetter:
+    action: send
+    channel:
+      $ref: '#/channels/deadLetter'
+    summary: Любой потребитель отправляет необработанное событие в DLQ
+    messages:
+    - $ref: '#/channels/deadLetter/messages/deadLetter'
+components:
+  messages:
+    ShipmentCreated:
+      name: shipment.created
+      title: Отправление создано
+      summary: Партнёр создал отправление. Запускает резервирование ячейки и открытие счёта.
+      description: 'Потребители: locker-service, payment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.created
+            payload:
+              $ref: '#/components/schemas/ShipmentCreatedPayload'
+    ShipmentRejected:
+      name: shipment.rejected
+      title: Отправление отклонено
+      summary: 'Ячейку забронировать не удалось. Компенсация: счёт закрывается.'
+      description: 'Потребители: payment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.rejected
+            payload:
+              $ref: '#/components/schemas/ShipmentRejectedPayload'
+    ShipmentCancelled:
+      name: shipment.cancelled
+      title: Отправление отменено
+      summary: 'Отменено партнёром либо истёк срок резерва. Компенсация: ячейка освобождается, счёт закрывается.'
+      description: 'Потребители: locker-service, payment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.cancelled
+            payload:
+              $ref: '#/components/schemas/ShipmentCancelledPayload'
+    ShipmentReadyForPickup:
+      name: shipment.ready_for_pickup
+      title: Посылка готова к выдаче
+      summary: 'Посылка заложена, начался срок хранения. Содержит всё необходимое для уведомления получателя. ВНИМАНИЕ:
+        содержит код получения в открытом виде (ADR-0008).'
+      description: 'Потребители: notification-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.ready_for_pickup
+            payload:
+              $ref: '#/components/schemas/ShipmentReadyForPickupPayload'
+    ShipmentPaid:
+      name: shipment.paid
+      title: Отправление оплачено
+      summary: Оплата подтверждена. Разрешает выдачу посылки по коду.
+      description: 'Потребители: locker-service, notification-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.paid
+            payload:
+              $ref: '#/components/schemas/ShipmentPaidPayload'
+    ShipmentDelivered:
+      name: shipment.delivered
+      title: Отправление выдано
+      summary: Получатель забрал посылку. Финальное событие успешного сценария.
+      description: 'Потребители: notification-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.delivered
+            payload:
+              $ref: '#/components/schemas/ShipmentDeliveredPayload'
+    ShipmentExpired:
+      name: shipment.expired
+      title: Срок хранения истёк
+      summary: Посылка не востребована. Код аннулируется, неоплаченный счёт закрывается.
+      description: 'Потребители: locker-service, payment-service, notification-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.expired
+            payload:
+              $ref: '#/components/schemas/ShipmentExpiredPayload'
+    ShipmentReturned:
+      name: shipment.returned
+      title: Отправление возвращено
+      summary: Курьер изъял посылку для возврата партнёру. Финальное событие.
+      description: 'Потребители: нет (зарезервировано для webhook партнёру, US-16)'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - shipment.returned
+            payload:
+              $ref: '#/components/schemas/ShipmentReturnedPayload'
+    LockerCellReserved:
+      name: locker.cell.reserved
+      title: Ячейка зарезервирована
+      summary: За отправлением закреплена ячейка.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.cell.reserved
+            payload:
+              $ref: '#/components/schemas/LockerCellReservedPayload'
+    LockerCellReservationFailed:
+      name: locker.cell.reservation_failed
+      title: Резервирование не удалось
+      summary: Подходящей ячейки нет либо постамат недоступен.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.cell.reservation_failed
+            payload:
+              $ref: '#/components/schemas/LockerCellReservationFailedPayload'
+    LockerCellReleased:
+      name: locker.cell.released
+      title: Ячейка освобождена
+      summary: Резерв снят из-за отмены отправления.
+      description: 'Потребители: нет (для аналитики загрузки)'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.cell.released
+            payload:
+              $ref: '#/components/schemas/LockerCellReleasedPayload'
+    LockerReservationExpired:
+      name: locker.reservation.expired
+      title: Резерв истёк
+      summary: Посылку не заложили за 5 суток (BR-04). Ячейка освобождена.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.reservation.expired
+            payload:
+              $ref: '#/components/schemas/LockerReservationExpiredPayload'
+    LockerParcelDeposited:
+      name: locker.parcel.deposited
+      title: Посылка заложена
+      summary: 'Курьер поместил посылку в ячейку. ВНИМАНИЕ: содержит код получения в открытом виде (ADR-0008).'
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.parcel.deposited
+            payload:
+              $ref: '#/components/schemas/LockerParcelDepositedPayload'
+    LockerParcelPickedUp:
+      name: locker.parcel.picked_up
+      title: Посылка выдана
+      summary: Получатель открыл ячейку по коду.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.parcel.picked_up
+            payload:
+              $ref: '#/components/schemas/LockerParcelPickedUpPayload'
+    LockerParcelReturned:
+      name: locker.parcel.returned
+      title: Посылка изъята
+      summary: Курьер забрал невостребованную посылку.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - locker.parcel.returned
+            payload:
+              $ref: '#/components/schemas/LockerParcelReturnedPayload'
+    PaymentSucceeded:
+      name: payment.succeeded
+      title: Платёж успешен
+      summary: PSP подтвердил оплату, счёт оплачен.
+      description: 'Потребители: shipment-service'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - payment.succeeded
+            payload:
+              $ref: '#/components/schemas/PaymentSucceededPayload'
+    PaymentFailed:
+      name: payment.failed
+      title: Платёж отклонён
+      summary: PSP сообщил об отказе. Счёт остаётся открытым, возможна новая попытка.
+      description: 'Потребители: нет (для аналитики конверсии оплаты)'
+      contentType: application/json
+      payload:
+        allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          properties:
+            eventType:
+              type: string
+              enum:
+              - payment.failed
+            payload:
+              $ref: '#/components/schemas/PaymentFailedPayload'
+    DeadLetter:
+      name: dead-letter
+      title: Необработанное событие
+      contentType: application/json
+      payload:
+        type: object
+        required:
+        - consumer
+        - event
+        properties:
+          consumer:
+            type: string
+            description: Группа потребителей, не сумевшая обработать событие
+          event:
+            $ref: '#/components/schemas/Envelope'
+  schemas:
+    Envelope:
+      type: object
+      description: Единый конверт события
+      required:
+      - eventId
+      - eventType
+      - eventVersion
+      - occurredAt
+      - source
+      - correlationId
+      - key
+      - payload
+      properties:
+        eventId:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор события, ключ дедупликации у потребителя
+        eventType:
+          type: string
+          description: Тип события в формате <контекст>.<сущность>.<факт>
+        eventVersion:
+          type: integer
+          enum:
+          - 1
+          description: Версия схемы полезной нагрузки
+        occurredAt:
+          type: string
+          format: date-time
+          description: Момент возникновения события, UTC
+        source:
+          type: string
+          enum:
+          - shipment-service
+          - locker-service
+          - payment-service
+          description: Сервис-издатель
+        correlationId:
+          type: string
+          description: Сквозной идентификатор запроса, породившего цепочку событий
+        key:
+          type: string
+          description: Ключ партиционирования, равен shipmentId
+        payload:
+          type: object
+          description: Полезная нагрузка, зависит от eventType
+    Recipient:
+      type: object
+      description: 'Получатель. Персональные данные: доступ к топику ограничивается ACL'
+      required:
+      - name
+      - phone
+      properties:
+        name:
+          type: string
+        phone:
+          type: string
+          description: Формат E.164
+        email:
+          type: string
+          nullable: true
+    ShipmentCreatedPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - parcelSize
+      - paymentType
+      - amount
+      - currency
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        parcelSize:
+          type: string
+          enum:
+          - S
+          - M
+          - L
+          description: Размер посылки
+        paymentType:
+          type: string
+          enum:
+          - PREPAID
+          - ON_PICKUP
+          description: Тип оплаты
+        amount:
+          type: integer
+          format: int64
+          description: Сумма в копейках
+        currency:
+          type: string
+          description: Код валюты ISO 4217, например RUB
+    ShipmentRejectedPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - reason
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        reason:
+          type: string
+          enum:
+          - NO_FREE_CELLS
+          - LOCKER_NOT_FOUND
+          - LOCKER_UNAVAILABLE
+          description: Причина отказа в резервировании
+    ShipmentCancelledPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - reason
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        reason:
+          type: string
+          description: CANCELLED_BY_PARTNER, RESERVATION_EXPIRED либо текст партнёра
+    ShipmentReadyForPickupPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - recipient
+      - pickupCode
+      - lockerAddress
+      - cellNumber
+      - storageUntil
+      - paymentRequired
+      - amount
+      - currency
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        pickupCode:
+          type: string
+          pattern: ^\d{6}$
+          description: Одноразовый код получения
+        lockerAddress:
+          type: string
+          description: Адрес постамата
+        cellNumber:
+          type: integer
+          description: Номер ячейки
+        storageUntil:
+          type: string
+          format: date-time
+          description: Окончание срока хранения
+        paymentRequired:
+          type: boolean
+          description: Требуется ли оплата перед выдачей
+        amount:
+          type: integer
+          format: int64
+          description: Сумма в копейках
+        currency:
+          type: string
+          description: Код валюты ISO 4217, например RUB
+    ShipmentPaidPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - recipient
+      - amount
+      - currency
+      - paymentId
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        amount:
+          type: integer
+          format: int64
+          description: Сумма в копейках
+        currency:
+          type: string
+          description: Код валюты ISO 4217, например RUB
+        paymentId:
+          type: string
+          format: uuid
+          description: Успешный платёж
+    ShipmentDeliveredPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - recipient
+      - deliveredAt
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        deliveredAt:
+          type: string
+          format: date-time
+          description: Момент открытия ячейки
+    ShipmentExpiredPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      - recipient
+      - lockerAddress
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+        recipient:
+          $ref: '#/components/schemas/Recipient'
+        lockerAddress:
+          type: string
+          description: Адрес постамата
+    ShipmentReturnedPayload:
+      type: object
+      required:
+      - shipmentId
+      - partnerId
+      - externalOrderId
+      - lockerId
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        partnerId:
+          type: string
+          format: uuid
+          description: Партнёр-владелец
+        externalOrderId:
+          type: string
+          description: Номер заказа в системе партнёра
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат назначения
+    LockerCellReservedPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      - lockerCode
+      - lockerAddress
+      - cellNumber
+      - cellSize
+      - reservedUntil
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        lockerCode:
+          type: string
+          description: Код постамата, например MSK-001
+        lockerAddress:
+          type: string
+          description: Адрес постамата
+        cellNumber:
+          type: integer
+          description: Номер ячейки
+        cellSize:
+          type: string
+          enum:
+          - S
+          - M
+          - L
+          description: Фактический размер ячейки (может быть больше размера посылки, BR-03)
+        reservedUntil:
+          type: string
+          format: date-time
+          description: До какого момента резерв ждёт закладки (BR-04)
+    LockerCellReservationFailedPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      - reason
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        reason:
+          type: string
+          enum:
+          - NO_FREE_CELLS
+          - LOCKER_NOT_FOUND
+          - LOCKER_UNAVAILABLE
+          description: Причина отказа в резервировании
+    LockerCellReleasedPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        reason:
+          type: string
+          nullable: true
+          description: Причина отмены
+    LockerReservationExpiredPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+    LockerParcelDepositedPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      - cellNumber
+      - pickupCode
+      - courierId
+      - depositedAt
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        cellNumber:
+          type: integer
+          description: Номер ячейки
+        pickupCode:
+          type: string
+          pattern: ^\d{6}$
+          description: Одноразовый код получения
+        courierId:
+          type: string
+          description: Курьер
+        depositedAt:
+          type: string
+          format: date-time
+          description: Момент закладки
+    LockerParcelPickedUpPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      - cellNumber
+      - pickedUpAt
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        cellNumber:
+          type: integer
+          description: Номер ячейки
+        pickedUpAt:
+          type: string
+          format: date-time
+          description: Момент выдачи
+    LockerParcelReturnedPayload:
+      type: object
+      required:
+      - shipmentId
+      - lockerId
+      - cellNumber
+      - courierId
+      - returnedAt
+      properties:
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        lockerId:
+          type: string
+          format: uuid
+          description: Постамат
+        cellNumber:
+          type: integer
+          description: Номер ячейки
+        courierId:
+          type: string
+          description: Курьер
+        returnedAt:
+          type: string
+          format: date-time
+          description: Момент изъятия
+    PaymentSucceededPayload:
+      type: object
+      required:
+      - paymentId
+      - shipmentId
+      - amount
+      - currency
+      - paidAt
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Идентификатор платежа
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        amount:
+          type: integer
+          format: int64
+          description: Сумма в копейках
+        currency:
+          type: string
+          description: Код валюты ISO 4217, например RUB
+        paidAt:
+          type: string
+          format: date-time
+          description: Момент подтверждения
+    PaymentFailedPayload:
+      type: object
+      required:
+      - paymentId
+      - shipmentId
+      - amount
+      - currency
+      properties:
+        paymentId:
+          type: string
+          format: uuid
+          description: Идентификатор платежа
+        shipmentId:
+          type: string
+          format: uuid
+          description: Идентификатор отправления
+        amount:
+          type: integer
+          format: int64
+          description: Сумма в копейках
+        currency:
+          type: string
+          description: Код валюты ISO 4217, например RUB

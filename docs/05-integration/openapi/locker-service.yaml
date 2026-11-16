@@ -1,0 +1,312 @@
+openapi: 3.0.3
+info:
+  title: LockerFlow — Locker Service API
+  version: 1.0.0
+  description: |
+    Справочник постаматов и операции терминала: закладка, выдача, изъятие.
+
+    Резервирование ячеек через REST **не выполняется** — оно происходит автоматически по событию
+    `shipment.created` (см. AsyncAPI).
+
+    Ошибки — в формате RFC 7807 (`application/problem+json`).
+
+    > **Ограничение прототипа:** операции терминала не аутентифицируются. Целевое решение —
+    > mTLS для терминала и JWT для курьера (ADR-0007).
+servers:
+  - url: http://localhost:8080
+    description: Локальный стенд (через API Gateway)
+  - url: http://localhost:8002
+    description: Локальный стенд (напрямую, включая /internal)
+tags:
+  - name: lockers
+    description: Справочник постаматов
+  - name: operations
+    description: Операции на терминале постамата
+  - name: internal
+    description: Операторские действия. Не публикуются через API Gateway
+
+paths:
+  /api/v1/lockers:
+    get:
+      tags: [lockers]
+      operationId: listLockers
+      summary: Список постаматов
+      description: Для виджета выбора постамата на сайте магазина (FR-12).
+      parameters:
+        - name: city
+          in: query
+          description: Точное название города
+          schema: { type: string, example: Москва }
+      responses:
+        '200':
+          description: Постаматы
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Locker' }
+
+  /api/v1/lockers/{lockerId}:
+    get:
+      tags: [lockers]
+      operationId: getLocker
+      summary: Получить постамат
+      parameters:
+        - $ref: '#/components/parameters/LockerId'
+      responses:
+        '200':
+          description: Постамат
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Locker' }
+        '404': { $ref: '#/components/responses/LockerNotFound' }
+
+  /api/v1/lockers/{lockerId}/deposits:
+    post:
+      tags: [operations]
+      operationId: depositParcel
+      summary: Заложить посылку
+      description: |
+        Курьер помещает посылку в ячейку, зарезервированную за отправлением (FR-16, UC-02).
+        Генерируется код получения; получателю уходит SMS.
+      parameters:
+        - $ref: '#/components/parameters/LockerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DepositRequest' }
+      responses:
+        '201':
+          description: Посылка заложена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DepositResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404':
+          description: '`LOCKER_NOT_FOUND` — постамат не найден; `RESERVATION_NOT_FOUND` — у отправления нет резерва в этом постамате'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`LOCKER_UNAVAILABLE` — постамат не работает; `INVALID_RESERVATION_STATE` — резерв не в статусе `RESERVED` (поле `currentStatus`)'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/v1/lockers/{lockerId}/pickups:
+    post:
+      tags: [operations]
+      operationId: pickupParcel
+      summary: Выдать посылку по коду
+      description: |
+        Получатель вводит код на терминале (FR-17, FR-18, UC-04).
+
+        Защита от подбора (BR-08): после 5 неверных кодов подряд ввод на постамате блокируется
+        на 10 минут; успешная выдача обнуляет счётчик.
+      parameters:
+        - $ref: '#/components/parameters/LockerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PickupRequest' }
+      responses:
+        '200':
+          description: Ячейка открыта
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PickupResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '403':
+          description: '`INVALID_PICKUP_CODE` — код не найден среди посылок постамата; поле `attemptsLeft` — оставшиеся попытки'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+              example:
+                type: https://docs.lockerflow.example/errors/INVALID_PICKUP_CODE
+                title: Invalid pickup code
+                status: 403
+                code: INVALID_PICKUP_CODE
+                detail: Неверный код получения
+                instance: /api/v1/lockers/11111111-1111-4111-8111-111111111111/pickups
+                correlationId: 5f0c1a2e-7c0b-4a57-9d3e-0d4f7f1f8a11
+                attemptsLeft: 3
+        '404': { $ref: '#/components/responses/LockerNotFound' }
+        '409':
+          description: '`PAYMENT_REQUIRED` — заказ не оплачен, поле `shipmentId` позволяет терминалу показать ссылку на оплату; `LOCKER_UNAVAILABLE` — постамат не работает'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '429':
+          description: '`PICKUP_BLOCKED` — ввод кода временно заблокирован; поле `retryAfterSeconds`'
+          headers:
+            Retry-After:
+              description: Секунд до снятия блокировки
+              schema: { type: integer }
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/v1/lockers/{lockerId}/returns:
+    post:
+      tags: [operations]
+      operationId: returnParcel
+      summary: Изъять невостребованную посылку
+      description: Курьер забирает посылку с истёкшим сроком хранения (FR-19, UC-06).
+      parameters:
+        - $ref: '#/components/parameters/LockerId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReturnRequest' }
+      responses:
+        '200':
+          description: Посылка изъята, ячейка свободна
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReturnResult' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404':
+          description: '`LOCKER_NOT_FOUND` либо `RESERVATION_NOT_FOUND`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`INVALID_RESERVATION_STATE` — срок хранения не истёк или посылка уже изъята; `LOCKER_UNAVAILABLE`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /internal/v1/lockers/{lockerId}/unblock:
+    post:
+      tags: [internal]
+      operationId: unblockLocker
+      summary: Снять блокировку ввода кода
+      description: Операторское действие (FR-20). Обнуляет счётчик неверных попыток.
+      parameters:
+        - $ref: '#/components/parameters/LockerId'
+      responses:
+        '200':
+          description: Блокировка снята
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lockerId, blocked]
+                properties:
+                  lockerId: { type: string, format: uuid }
+                  blocked: { type: boolean, example: false }
+        '404': { $ref: '#/components/responses/LockerNotFound' }
+
+components:
+  parameters:
+    LockerId:
+      name: lockerId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 11111111-1111-4111-8111-111111111111
+
+  responses:
+    LockerNotFound:
+      description: '`LOCKER_NOT_FOUND` — постамат не найден'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    ValidationError:
+      description: '`VALIDATION_ERROR` — некорректное тело запроса'
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    Locker:
+      type: object
+      required: [id, code, city, address, status, freeCells]
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: string, description: Человекочитаемый код, example: MSK-001 }
+        city: { type: string, example: Москва }
+        address: { type: string, example: 'Москва, ул. Тверская, 7' }
+        status:
+          type: string
+          enum: [ACTIVE, OFFLINE, MAINTENANCE]
+          description: Отправления принимаются только в постаматы со статусом `ACTIVE`
+        freeCells:
+          type: object
+          description: Количество свободных ячеек по размерам
+          required: [S, M, L]
+          properties:
+            S: { type: integer, example: 10 }
+            M: { type: integer, example: 6 }
+            L: { type: integer, example: 4 }
+    DepositRequest:
+      type: object
+      additionalProperties: false
+      required: [shipmentId, courierId]
+      properties:
+        shipmentId: { type: string, format: uuid, description: Считывается со штрихкода посылки }
+        courierId: { type: string, minLength: 1, maxLength: 64, example: courier-7 }
+    DepositResult:
+      type: object
+      required: [shipmentId, lockerId, cellNumber, cellSize, depositedAt]
+      properties:
+        shipmentId: { type: string, format: uuid }
+        lockerId: { type: string, format: uuid }
+        cellNumber: { type: integer, description: Номер открытой ячейки, example: 12 }
+        cellSize: { type: string, enum: [S, M, L] }
+        depositedAt: { type: string, format: date-time }
+    PickupRequest:
+      type: object
+      additionalProperties: false
+      required: [pickupCode]
+      properties:
+        pickupCode:
+          type: string
+          pattern: '^\d{6}$'
+          description: Код из SMS
+          example: '042137'
+    PickupResult:
+      type: object
+      required: [shipmentId, cellNumber, pickedUpAt]
+      properties:
+        shipmentId: { type: string, format: uuid }
+        cellNumber: { type: integer }
+        pickedUpAt: { type: string, format: date-time }
+    ReturnRequest:
+      type: object
+      additionalProperties: false
+      required: [shipmentId, courierId]
+      properties:
+        shipmentId: { type: string, format: uuid }
+        courierId: { type: string, minLength: 1, maxLength: 64 }
+    ReturnResult:
+      type: object
+      required: [shipmentId, cellNumber, returnedAt]
+      properties:
+        shipmentId: { type: string, format: uuid }
+        cellNumber: { type: integer }
+        returnedAt: { type: string, format: date-time }
+    Problem:
+      type: object
+      description: Ошибка в формате RFC 7807. Может содержать дополнительные поля, зависящие от кода
+      required: [type, title, status, code, detail, instance, correlationId]
+      additionalProperties: true
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: INVALID_PICKUP_CODE }
+        detail: { type: string }
+        instance: { type: string }
+        correlationId: { type: string }
+        attemptsLeft: { type: integer, description: Только для `INVALID_PICKUP_CODE` }
+        retryAfterSeconds: { type: integer, description: Только для `PICKUP_BLOCKED` }
+        currentStatus: { type: string, description: Только для `INVALID_RESERVATION_STATE` }
+        shipmentId: { type: string, format: uuid, description: Только для `PAYMENT_REQUIRED` }

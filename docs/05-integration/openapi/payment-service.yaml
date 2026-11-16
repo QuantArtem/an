@@ -1,0 +1,221 @@
+openapi: 3.0.3
+info:
+  title: LockerFlow — Payment Service API
+  version: 1.0.0
+  description: |
+    Оплата отправлений с типом `ON_PICKUP` через внешний платёжный шлюз (PSP).
+
+    * Счёт на оплату создаётся автоматически по событию `shipment.created` — отдельного API для него нет.
+    * Данные карты вводятся только на странице PSP и в LockerFlow не попадают.
+    * Суммы — целые числа в копейках.
+    * Ошибки — в формате RFC 7807 (`application/problem+json`).
+servers:
+  - url: http://localhost:8080
+    description: Локальный стенд (через API Gateway)
+tags:
+  - name: payments
+    description: Платежи получателя
+  - name: webhooks
+    description: Входящие уведомления платёжного шлюза
+
+paths:
+  /api/v1/payments:
+    post:
+      tags: [payments]
+      operationId: createPayment
+      summary: Создать платёж
+      description: |
+        Создаёт платёж в PSP на сумму счёта и возвращает ссылку на платёжную страницу (FR-22, FR-23, UC-03).
+
+        * Повтор с тем же `Idempotency-Key` возвращает тот же платёж (`200`, `Idempotent-Replayed: true`).
+        * Если по счёту уже есть незавершённый платёж, возвращается он (`200`) — BR-10.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 128 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [shipmentId]
+              properties:
+                shipmentId: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Платёж создан
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '200':
+          description: Возвращён существующий платёж (повтор запроса или незавершённый платёж по счёту)
+          headers:
+            Idempotent-Replayed:
+              description: '`true`, если совпал ключ идемпотентности'
+              schema: { type: string, enum: ['true'] }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400':
+          description: '`VALIDATION_ERROR` либо `IDEMPOTENCY_KEY_REQUIRED`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`INVOICE_NOT_FOUND` — у отправления нет счёта (неизвестное или предоплаченное отправление)'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '409':
+          description: '`ALREADY_PAID` — счёт оплачен; `INVOICE_CANCELLED` — отправление отменено или срок хранения истёк'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: '`IDEMPOTENCY_KEY_REUSED` — ключ уже использован для другого отправления'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '502':
+          description: '`PSP_UNAVAILABLE` — платёжный шлюз не ответил; платёж не создан, запрос можно повторить'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/v1/payments/{paymentId}:
+    get:
+      tags: [payments]
+      operationId: getPayment
+      summary: Получить платёж
+      description: Используется страницей оплаты для отображения результата после возврата с PSP (FR-26).
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Платёж
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '404':
+          description: '`PAYMENT_NOT_FOUND`'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /api/v1/webhooks/psp:
+    post:
+      tags: [webhooks]
+      operationId: receivePspWebhook
+      summary: Уведомление PSP о результате платежа
+      description: |
+        Вызывается платёжным шлюзом (FR-24, FR-25). Порядок обработки:
+
+        1. Проверка подписи: `X-PSP-Signature` = hex(HMAC-SHA256(секрет, **сырое тело запроса**)).
+        2. Дедупликация по `eventId` — повторное уведомление возвращает `200 {"result": "DUPLICATE"}`.
+        3. Сверка суммы и валюты с платежом (BR-11).
+        4. Применение результата, если платёж в статусе `PENDING`; иначе `200 {"result": "IGNORED"}`.
+
+        Ответ `2xx` означает «уведомление принято, повторять не нужно». Ответы `4xx` на некорректные
+        уведомления шлюз не повторяет; на `5xx` и таймаут — повторяет по своему расписанию.
+      parameters:
+        - name: X-PSP-Signature
+          in: header
+          required: true
+          description: Подпись тела в шестнадцатеричном виде
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PspWebhook' }
+            example:
+              eventId: evt_9f2c41d07a3b4e55
+              pspPaymentId: psp_3a1f0c9b77d24e10
+              merchantPaymentId: 0b7d2a3e-6a43-4f9e-bb5d-4c7f0f8d1e22
+              status: succeeded
+              amount: 149900
+              currency: RUB
+      responses:
+        '200':
+          description: Уведомление принято
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [result]
+                properties:
+                  result:
+                    type: string
+                    enum: [ACCEPTED, DUPLICATE, IGNORED]
+                    description: |
+                      * `ACCEPTED` — статус платежа изменён
+                      * `DUPLICATE` — уведомление с таким `eventId` уже обработано
+                      * `IGNORED` — платёж уже в финальном статусе
+        '400':
+          description: '`VALIDATION_ERROR` — тело не соответствует схеме'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '401':
+          description: '`INVALID_SIGNATURE` — подпись отсутствует или неверна'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '404':
+          description: '`PAYMENT_NOT_FOUND` — платёж из уведомления не найден'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+        '422':
+          description: '`AMOUNT_MISMATCH` — сумма или валюта не совпадают с платежом; требует разбора финансовой службой'
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+components:
+  schemas:
+    Payment:
+      type: object
+      required: [id, shipmentId, status, amount, currency, paymentUrl, createdAt, updatedAt]
+      properties:
+        id: { type: string, format: uuid, description: Передаётся в PSP как `merchantPaymentId` }
+        shipmentId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [PENDING, SUCCEEDED, FAILED]
+          description: '`SUCCEEDED` и `FAILED` — финальные, не изменяются (BR-11)'
+        amount: { type: integer, format: int64, description: Сумма в копейках, example: 149900 }
+        currency: { type: string, example: RUB }
+        paymentUrl: { type: string, format: uri, description: Страница оплаты на стороне PSP }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    PspWebhook:
+      type: object
+      additionalProperties: false
+      required: [eventId, pspPaymentId, merchantPaymentId, status, amount, currency]
+      properties:
+        eventId: { type: string, maxLength: 128, description: Идентификатор уведомления на стороне PSP — ключ дедупликации }
+        pspPaymentId: { type: string, description: Идентификатор платежа в PSP }
+        merchantPaymentId: { type: string, format: uuid, description: Идентификатор платежа в LockerFlow }
+        status: { type: string, enum: [succeeded, failed] }
+        amount: { type: integer, format: int64 }
+        currency: { type: string }
+    Problem:
+      type: object
+      description: Ошибка в формате RFC 7807
+      required: [type, title, status, code, detail, instance, correlationId]
+      additionalProperties: true
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: ALREADY_PAID }
+        detail: { type: string }
+        instance: { type: string }
+        correlationId: { type: string }

@@ -284,7 +284,7 @@ def test_tc10_pickup_code_bruteforce_protection():
 
 # ---------- TC-11: безопасность webhook ----------
 def test_tc11_webhook_security():
-    sid, _ = to_ready(pay_type="ON_PICKUP", amount=77700)
+    sid, code = to_ready(pay_type="ON_PICKUP", amount=77700)
     p = api.post("/api/v1/payments", json={"shipmentId": sid}, headers={"Idempotency-Key": str(uuid4())}).json()
 
     def hook(amount, secret=WEBHOOK_SECRET):
@@ -301,6 +301,7 @@ def test_tc11_webhook_security():
     assert hook(77700).json() == {"result": "ACCEPTED"}
     assert hook(77700).json() == {"result": "IGNORED"}   # новое уведомление по уже завершённому платежу
     wait_for(lambda: get(sid), lambda s: s["paymentStatus"] == "PAID", what="PAID")
+    wait_for(lambda: pickup(code), lambda r: r.status_code == 200, what="pickup after payment")
 
 
 # ---------- TC-12: сквозной correlation id ----------
